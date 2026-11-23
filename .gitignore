@@ -1,0 +1,14 @@
+.env
+.env.*
+*.pem
+*.key
+*.db
+*.db-*
+*.sqlite*
+*.log
+*.bak
+auth.json
+service.json
+opencode.json
+opencode.jsonc
+rclone.conf
