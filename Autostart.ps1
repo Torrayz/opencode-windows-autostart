@@ -3,7 +3,8 @@
 param(
     [Parameter(Position = 0)]
     [ValidateSet('Check', 'Install', 'Status', 'Uninstall')]
-    [string]$Action = 'Status'
+    [string]$Action = 'Status',
+    [switch]$AllowPhysicalPC
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,13 +20,13 @@ function Assert-PreviewTestMachine {
         ($computer.Manufacturer -eq 'VMware, Inc.' -and $computer.Model -like 'VMware*') -or
         ($computer.Manufacturer -in 'innotek GmbH', 'Oracle Corporation' -and $computer.Model -eq 'VirtualBox') -or
         ($computer.Manufacturer -eq 'QEMU' -and $computer.Model -in 'Standard PC (Q35 + ICH9, 2009)', 'Standard PC (i440FX + PIIX, 1996)')
-    if (-not $supported) {
-        throw 'Preview installation is limited to a recognized Windows test VM. Use Check or Status on your main PC.'
+    if (-not $supported -and -not $AllowPhysicalPC) {
+        throw 'Use a test VM or explicitly opt into the physical PC beta with Install -AllowPhysicalPC.'
     }
 
     $listeners = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
     if ($listeners | Where-Object { $_.Port -in 20128, 28894 }) {
-        throw 'Port 20128 or 28894 is in use. No tasks were installed. Use a clean test VM, without another app instance running.'
+        throw 'Port 20128 or 28894 is in use. Exit both apps normally, then rerun Install. No tasks were installed.'
     }
 }
 
@@ -41,19 +42,19 @@ if ($Action -in 'Check', 'Install') {
         Select-Object -First 1
     if (-not $openCode) { throw 'OpenCode was not found on PATH. Install OpenCode V2, then open a new PowerShell window.' }
 
-    $actions = @{}
-    $actions[$taskNames[0]] = New-ScheduledTaskAction -Execute $node -WorkingDirectory $env:USERPROFILE `
-        -Argument ('"{0}" --no-browser --host 127.0.0.1 --port 20128 --skip-update' -f $routerCli)
-    $openCodeArgs = 'serve --service --hostname 127.0.0.1 --port 28894'
-    if ($openCode.Source.EndsWith('.cmd', [StringComparison]::OrdinalIgnoreCase)) {
-        if ($openCode.Source.Contains('%')) { throw 'OpenCode paths containing % are not supported by the CMD launcher.' }
-        $openCodeArgs = '/d /v:off /s /c ""{0}" {1}"' -f $openCode.Source, $openCodeArgs
-        $openCodeExe = Join-Path $env:SystemRoot 'System32\cmd.exe'
-    } else {
-        $openCodeExe = $openCode.Source
+    if ($openCode.Source.EndsWith('.cmd', [StringComparison]::OrdinalIgnoreCase) -and $openCode.Source.Contains('%')) {
+        throw 'OpenCode paths containing % are not supported by the CMD launcher.'
     }
-    $actions[$taskNames[1]] = New-ScheduledTaskAction -Execute $openCodeExe -WorkingDirectory $env:USERPROFILE `
-        -Argument $openCodeArgs
+    $launcher = Join-Path $PSScriptRoot 'Start-Guarded.ps1'
+    if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) { throw 'Missing Start-Guarded.ps1.' }
+    $powershell = Join-Path $PSHOME 'powershell.exe'
+    if (-not (Test-Path -LiteralPath $powershell -PathType Leaf)) { throw 'Use Windows PowerShell 5.1 for this installer.' }
+    $prefix = '-NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "{0}"' -f $launcher
+    $actions = @{}
+    $actions[$taskNames[0]] = New-ScheduledTaskAction -Execute $powershell -WorkingDirectory $env:USERPROFILE `
+        -Argument ('{0} -App Router -Executable "{1}" -RouterCli "{2}"' -f $prefix, $node, $routerCli)
+    $actions[$taskNames[1]] = New-ScheduledTaskAction -Execute $powershell -WorkingDirectory $env:USERPROFILE `
+        -Argument ('{0} -App OpenCode -Executable "{1}"' -f $prefix, $openCode.Source)
 
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) `
@@ -126,8 +127,8 @@ if ($Action -eq 'Uninstall') {
 }
 
 Assert-PreviewTestMachine
-Write-Warning 'Use a disposable VM without production app data. Do not run a second copy of either app alongside these tasks.'
-if ((Read-Host 'Type TEST to confirm this is a disposable test VM') -cne 'TEST') {
+Write-Warning 'Save your work. Do not use these tasks alongside another autostart for either app or launch another 9router manually while the task is running.'
+if ((Read-Host 'Type TEST to confirm you understand the beta limitations') -cne 'TEST') {
     throw 'Cancelled. No tasks were installed.'
 }
 

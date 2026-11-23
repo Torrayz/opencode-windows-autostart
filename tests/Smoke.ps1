@@ -3,9 +3,37 @@ $ErrorActionPreference = 'Stop'
 $installer = Join-Path (Split-Path $PSScriptRoot -Parent) 'Autostart.ps1'
 $definitions = @(& $installer Check)
 if ($definitions.Count -ne 2 -or @($definitions | Where-Object {
-    $_.Trigger -ne 'AtStartup' -or $_.Arguments -notmatch '127\.0\.0\.1'
+    $_.Trigger -ne 'AtStartup' -or $_.Arguments -notmatch 'Start-Guarded\.ps1'
 }).Count -ne 0) {
-    throw 'Expected two loopback-only boot tasks.'
+    throw 'Expected two guarded boot tasks.'
+}
+if ($definitions[0].Arguments -notmatch ' -App Router ' -or
+    $definitions[1].Arguments -notmatch ' -App OpenCode ') {
+    throw 'Wrong app arguments for guarded boot tasks.'
+}
+
+& {
+    $launcher = Join-Path (Split-Path $installer -Parent) 'Start-Guarded.ps1'
+    $missing = Join-Path $PSScriptRoot 'does-not-exist.exe'
+    $ports = @{ Router = 20128; OpenCode = 28894 }
+    $network = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties()
+    foreach ($app in 'Router', 'OpenCode') {
+        $port = $ports[$app]
+        $socket = $null
+        try {
+            if (-not ($network.GetActiveTcpListeners() | Where-Object Port -eq $port)) {
+                $socket = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $port)
+                $socket.Start()
+            }
+            $output = & (Join-Path $PSHOME 'powershell.exe') -NoProfile -NonInteractive -File $launcher `
+                -App $app -Executable $missing -RouterCli $missing | Out-String
+            if ($LASTEXITCODE -ne 0 -or $output -notmatch 'already listening') {
+                throw "$app boot guard did not skip a busy port."
+            }
+        } finally {
+            if ($socket) { $socket.Stop() }
+        }
+    }
 }
 
 & {
@@ -50,7 +78,7 @@ if ($definitions.Count -ne 2 -or @($definitions | Where-Object {
         Assert-PreviewTestMachine
         throw 'Preview machine check accepted a physical PC.'
     } catch {
-        if ($_.Exception.Message -notlike '*recognized Windows test VM*') { throw }
+        if ($_.Exception.Message -notlike '*opt into the physical PC beta*') { throw }
     }
 
     function Get-CimInstance {
