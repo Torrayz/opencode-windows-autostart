@@ -4,30 +4,47 @@ param(
     [Parameter(Position = 0)]
     [ValidateSet('Check', 'Install', 'Status', 'Uninstall')]
     [string]$Action = 'Status',
-    [switch]$AllowPhysicalPC
+    [switch]$AllowPhysicalPC,
+    [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$userShort = $identity.Name.Split('\')[-1]
 $ownerTag = "opencode-windows-autostart (owner: $($identity.User.Value))"
+$managedTags = @(
+    $ownerTag,
+    "Windows-Autostart for ${userShort}: start local apps at Windows boot."
+)
 $taskNames = '9router AutoStart', 'OpenCode AutoStart'
 $taskPath = '\'
 
-function Assert-PreviewTestMachine {
-    $computer = Get-CimInstance -ClassName Win32_ComputerSystem
-    # HypervisorPresent alone also matches some physical PCs running Hyper-V or VBS.
-    $supported = ($computer.Manufacturer -eq 'Microsoft Corporation' -and $computer.Model -eq 'Virtual Machine') -or
-        ($computer.Manufacturer -eq 'VMware, Inc.' -and $computer.Model -like 'VMware*') -or
-        ($computer.Manufacturer -in 'innotek GmbH', 'Oracle Corporation' -and $computer.Model -eq 'VirtualBox') -or
-        ($computer.Manufacturer -eq 'QEMU' -and $computer.Model -in 'Standard PC (Q35 + ICH9, 2009)', 'Standard PC (i440FX + PIIX, 1996)')
-    if (-not $supported -and -not $AllowPhysicalPC) {
-        throw 'Use a test VM or explicitly opt into the physical PC beta with Install -AllowPhysicalPC.'
+function New-AutostartTriggers {
+    param(
+        [Parameter(Mandatory)][string]$UserId,
+        [Parameter(Mandatory)][int]$BootDelaySeconds,
+        [Parameter(Mandatory)][int]$LogonDelaySeconds,
+        [Parameter(Mandatory)][int]$NetworkDelaySeconds
+    )
+
+    $bootTrigger = New-ScheduledTaskTrigger -AtStartup
+    $bootTrigger.Delay = "PT${BootDelaySeconds}S"
+
+    $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $UserId
+    $logonTrigger.Delay = "PT${LogonDelaySeconds}S"
+
+    $list = @($bootTrigger, $logonTrigger)
+
+    $evtClass = Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace Root/Microsoft/Windows/TaskScheduler -ErrorAction SilentlyContinue
+    if ($evtClass) {
+        $evtTrigger = New-CimInstance -CimClass $evtClass -ClientOnly
+        $evtTrigger.Enabled = $true
+        $evtTrigger.Delay = "PT${NetworkDelaySeconds}S"
+        $evtTrigger.Subscription = '<QueryList><Query Id="0" Path="Microsoft-Windows-NetworkProfile/Operational"><Select Path="Microsoft-Windows-NetworkProfile/Operational">*[System[Provider[@Name=''Microsoft-Windows-NetworkProfile''] and EventID=10000]]</Select></Query></QueryList>'
+        $list += $evtTrigger
     }
 
-    $listeners = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
-    if ($listeners | Where-Object { $_.Port -in 20128, 28894 }) {
-        throw 'Port 20128 or 28894 is in use. Exit both apps normally, then rerun Install. No tasks were installed.'
-    }
+    return $list
 }
 
 if ($Action -in 'Check', 'Install') {
@@ -42,31 +59,54 @@ if ($Action -in 'Check', 'Install') {
         Select-Object -First 1
     if (-not $openCode) { throw 'OpenCode was not found on PATH. Install OpenCode V2, then open a new PowerShell window.' }
 
-    if ($openCode.Source.EndsWith('.cmd', [StringComparison]::OrdinalIgnoreCase) -and $openCode.Source.Contains('%')) {
-        throw 'OpenCode paths containing % are not supported by the CMD launcher.'
+    $openCodeExe = $openCode.Source
+    if ($openCodeExe.EndsWith('.cmd', [StringComparison]::OrdinalIgnoreCase)) {
+        $directExe = Join-Path (Split-Path $openCodeExe -Parent) 'node_modules\@opencode\cli\bin\opencode.exe'
+        if (Test-Path -LiteralPath $directExe -PathType Leaf) {
+            $openCodeExe = $directExe
+        } elseif ($openCodeExe.Contains('%')) {
+            throw 'OpenCode paths containing % are not supported by the CMD launcher.'
+        }
     }
+
     $launcher = Join-Path $PSScriptRoot 'Start-Guarded.ps1'
     if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) { throw 'Missing Start-Guarded.ps1.' }
     $powershell = Join-Path $PSHOME 'powershell.exe'
     if (-not (Test-Path -LiteralPath $powershell -PathType Leaf)) { throw 'Use Windows PowerShell 5.1 for this installer.' }
-    $prefix = '-NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "{0}"' -f $launcher
+    $prefix = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy RemoteSigned -File "{0}"' -f $launcher
+
     $actions = @{}
     $actions[$taskNames[0]] = New-ScheduledTaskAction -Execute $powershell -WorkingDirectory $env:USERPROFILE `
         -Argument ('{0} -App Router -Executable "{1}" -RouterCli "{2}"' -f $prefix, $node, $routerCli)
     $actions[$taskNames[1]] = New-ScheduledTaskAction -Execute $powershell -WorkingDirectory $env:USERPROFILE `
-        -Argument ('{0} -App OpenCode -Executable "{1}"' -f $prefix, $openCode.Source)
+        -Argument ('{0} -App OpenCode -Executable "{1}"' -f $prefix, $openCodeExe)
 
-    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries `
-        -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) `
-        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $triggers = @{}
+    $triggers[$taskNames[0]] = New-AutostartTriggers -UserId $identity.Name -BootDelaySeconds 5 -LogonDelaySeconds 3 -NetworkDelaySeconds 2
+    # IgnoreNew makes this a scheduler-only tick while the managed server runs.
+    $triggers[$taskNames[0]] += New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) -RepetitionInterval (New-TimeSpan -Minutes 2)
+    $triggers[$taskNames[1]] = New-AutostartTriggers -UserId $identity.Name -BootDelaySeconds 10 -LogonDelaySeconds 6 -NetworkDelaySeconds 5
+
+    $settings = New-ScheduledTaskSettingsSet `
+        -StartWhenAvailable `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -DontStopOnIdleEnd `
+        -MultipleInstances IgnoreNew `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) `
+        -RestartCount 5 `
+        -RestartInterval (New-TimeSpan -Minutes 1)
+
+    $taskPrincipal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType S4U -RunLevel Limited
 
     if ($Action -eq 'Check') {
         foreach ($name in $taskNames) {
             [pscustomobject]@{
                 Task = $name
                 Account = $identity.Name
-                Trigger = 'AtStartup'
+                LogonType = 'S4U'
+                Trigger = 'AtStartup, AtLogOn, OnNetworkConnect'
+                RecoveryInterval = ($triggers[$name] | ForEach-Object { $_.Repetition.Interval } | Where-Object { $_ })
                 Executable = $actions[$name].Execute
                 Arguments = $actions[$name].Arguments
             }
@@ -76,7 +116,7 @@ if ($Action -in 'Check', 'Install') {
 }
 
 $existing = @{}
-Get-ScheduledTask -TaskPath $taskPath | Where-Object { $_.TaskName -in $taskNames } | ForEach-Object {
+Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -in $taskNames } | ForEach-Object {
     $existing[$_.TaskName] = $_
 }
 
@@ -97,18 +137,17 @@ if ($Action -eq 'Status') {
 
 if ($Action -eq 'Install') {
     foreach ($name in $taskNames) {
-        if ($existing[$name] -and $existing[$name].Description -ne $ownerTag) {
+        if ($existing[$name] -and ($existing[$name].Description -notin $managedTags) -and -not $Force) {
             throw "Task '$name' already exists and is not managed by this installer. It was not changed."
         }
     }
-    $targets = @($taskNames | Where-Object { -not $existing[$_] })
+    $targets = @($taskNames)
 } else {
-    $targets = @($taskNames | Where-Object { $existing[$_].Description -eq $ownerTag })
+    $targets = @($taskNames | Where-Object { $existing[$_] -and ($existing[$_].Description -in $managedTags) })
 }
 
 if ($targets.Count -eq 0) {
-    if ($Action -eq 'Install') { Write-Host 'Both autostart tasks are already installed.' }
-    else { Write-Host 'No tasks managed by this installer were found.' }
+    Write-Host 'No tasks managed by this installer were found.'
     return
 }
 if (-not $PSCmdlet.ShouldProcess(($targets -join ', '), $Action)) { return }
@@ -126,35 +165,29 @@ if ($Action -eq 'Uninstall') {
     return
 }
 
-Assert-PreviewTestMachine
-Write-Warning 'Save your work. Do not use these tasks alongside another autostart for either app or launch another 9router manually while the task is running.'
-if ((Read-Host 'Type TEST to confirm you understand the beta limitations') -cne 'TEST') {
-    throw 'Cancelled. No tasks were installed.'
+$updated = @()
+foreach ($name in $targets) {
+    Register-ScheduledTask -TaskName $name -TaskPath $taskPath `
+        -Action $actions[$name] `
+        -Trigger $triggers[$name] `
+        -Settings $settings `
+        -Principal $taskPrincipal `
+        -Description $ownerTag `
+        -Force | Out-Null
+    $updated += $name
 }
 
-$secret = Read-Host "Windows password for $($identity.Name) (not your PIN)" -AsSecureString
-$created = @()
-try {
-    if ($secret.Length -eq 0) { throw 'No password entered. No tasks were installed.' }
-    $credential = New-Object System.Management.Automation.PSCredential($identity.Name, $secret)
-    foreach ($name in $targets) {
-        Register-ScheduledTask -TaskName $name -TaskPath $taskPath -Trigger $trigger -Settings $settings `
-            -Action $actions[$name] -User $identity.Name -Password ($credential.GetNetworkCredential().Password) `
-            -RunLevel Limited -Description $ownerTag | Out-Null
-        $created += $name
+# Start any task whose target port is not yet listening so it comes online immediately.
+$activePorts = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners().Port
+$taskPorts = @{
+    '9router AutoStart'  = 20128
+    'OpenCode AutoStart' = 28894
+}
+foreach ($name in $updated) {
+    $port = $taskPorts[$name]
+    if ($activePorts -notcontains $port) {
+        Start-ScheduledTask -TaskName $name -TaskPath $taskPath
     }
-} catch {
-    foreach ($name in $created) {
-        $task = Get-ScheduledTask -TaskName $name -TaskPath $taskPath -ErrorAction SilentlyContinue
-        if ($task -and $task.Description -eq $ownerTag) {
-            try { Unregister-ScheduledTask -TaskName $name -TaskPath $taskPath -Confirm:$false }
-            catch { Write-Warning "Could not roll back '$name'. Check Status before retrying." }
-        }
-    }
-    throw
-} finally {
-    $secret.Dispose()
-    Remove-Variable credential -ErrorAction SilentlyContinue
 }
 
-Write-Host "Installed: $($created -join ', '). Test on the next Windows restart."
+Write-Host "Installed: $($updated -join ', '). Active at boot, sign-in, and network connect."

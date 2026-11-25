@@ -3,9 +3,14 @@ $ErrorActionPreference = 'Stop'
 $installer = Join-Path (Split-Path $PSScriptRoot -Parent) 'Autostart.ps1'
 $definitions = @(& $installer Check)
 if ($definitions.Count -ne 2 -or @($definitions | Where-Object {
-    $_.Trigger -ne 'AtStartup' -or $_.Arguments -notmatch 'Start-Guarded\.ps1'
+    $_.LogonType -ne 'S4U' -or
+    $_.Trigger -ne 'AtStartup, AtLogOn, OnNetworkConnect' -or
+    $_.Arguments -notmatch 'Start-Guarded\.ps1'
 }).Count -ne 0) {
-    throw 'Expected two guarded boot tasks.'
+    throw 'Expected two guarded S4U tasks with startup, logon, and network triggers.'
+}
+if ($definitions[0].RecoveryInterval -ne 'PT2M' -or $definitions[1].RecoveryInterval) {
+    throw 'Expected a two-minute recovery trigger for 9router only.'
 }
 if ($definitions[0].Arguments -notmatch ' -App Router ' -or
     $definitions[1].Arguments -notmatch ' -App OpenCode ') {
@@ -26,7 +31,7 @@ if ($definitions[0].Arguments -notmatch ' -App Router ' -or
                 $socket.Start()
             }
             $output = & (Join-Path $PSHOME 'powershell.exe') -NoProfile -NonInteractive -File $launcher `
-                -App $app -Executable $missing -RouterCli $missing | Out-String
+                -App $app -Executable $missing -RouterCli $missing 2>&1 | Out-String
             if ($LASTEXITCODE -ne 0 -or $output -notmatch 'already listening') {
                 throw "$app boot guard did not skip a busy port."
             }
@@ -37,7 +42,7 @@ if ($definitions[0].Arguments -notmatch ' -App Router ' -or
 }
 
 & {
-    function Get-ScheduledTask { param($TaskPath) }
+    function Get-ScheduledTask { param($TaskPath, $ErrorAction) }
     function Register-ScheduledTask { throw 'Install -WhatIf tried to register a task.' }
     $status = @(& $installer Status)
     if ($status.Count -ne 2 -or @($status | Where-Object State -ne 'Not installed').Count -ne 0) {
@@ -47,8 +52,21 @@ if ($definitions[0].Arguments -notmatch ' -App Router ' -or
 }
 
 & {
+    $userShort = [Security.Principal.WindowsIdentity]::GetCurrent().Name.Split('\')[-1]
     function Get-ScheduledTask {
-        param($TaskPath)
+        param($TaskPath, $ErrorAction)
+        [pscustomobject]@{
+            TaskName = '9router AutoStart'
+            Description = "Windows-Autostart for ${userShort}: start local apps at Windows boot."
+        }
+    }
+    function Register-ScheduledTask { throw 'Legacy upgrade -WhatIf tried to register a task.' }
+    & $installer Install -WhatIf
+}
+
+& {
+    function Get-ScheduledTask {
+        param($TaskPath, $ErrorAction)
         [pscustomobject]@{ TaskName = '9router AutoStart'; Description = 'Existing installer' }
     }
     function Register-ScheduledTask { throw 'Install attempted to overwrite a task.' }
@@ -60,48 +78,6 @@ if ($definitions[0].Arguments -notmatch ' -App Router ' -or
         if ($_.Exception.Message -notlike '*already exists and is not managed*') { throw }
     }
     & $installer Uninstall
-}
-
-& {
-    $source = Get-Content -LiteralPath $installer -Raw
-    $ast = [scriptblock]::Create($source).Ast.Find({
-        param($node)
-        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-        $node.Name -eq 'Assert-PreviewTestMachine'
-    }, $false)
-    . ([scriptblock]::Create($ast.Extent.Text))
-    function Get-CimInstance {
-        param($ClassName)
-        [pscustomobject]@{ Manufacturer = 'Dell Inc.'; Model = 'Latitude'; HypervisorPresent = $true }
-    }
-    try {
-        Assert-PreviewTestMachine
-        throw 'Preview machine check accepted a physical PC.'
-    } catch {
-        if ($_.Exception.Message -notlike '*opt into the physical PC beta*') { throw }
-    }
-
-    function Get-CimInstance {
-        param($ClassName)
-        [pscustomobject]@{ Manufacturer = 'Microsoft Corporation'; Model = 'Virtual Machine' }
-    }
-    $network = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties()
-    $listener = $null
-    try {
-        if (-not ($network.GetActiveTcpListeners() | Where-Object { $_.Port -in 20128, 28894 })) {
-            Assert-PreviewTestMachine
-            $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 20128)
-            $listener.Start()
-        }
-        try {
-            Assert-PreviewTestMachine
-            throw 'Preview machine check accepted an occupied port.'
-        } catch {
-            if ($_.Exception.Message -notlike '*port*in use*') { throw }
-        }
-    } finally {
-        if ($listener) { $listener.Stop() }
-    }
 }
 
 Write-Host 'Smoke test passed. No tasks were changed.'
